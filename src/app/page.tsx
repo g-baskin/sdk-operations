@@ -1,7 +1,9 @@
+import { ModelTester } from "./model-tester";
+
 export default function Home() {
   return (
     <main className="flex min-h-screen items-center justify-center px-6 py-24">
-      <section className="w-full max-w-3xl">
+      <div className="w-full max-w-3xl">
         <p className="text-sm font-medium uppercase tracking-[0.3em] text-zinc-500">
           SDK Operations
         </p>
@@ -11,7 +13,8 @@ export default function Home() {
         <p className="mt-6 max-w-2xl text-lg leading-8 text-zinc-600 dark:text-zinc-400">
           A clean Next.js workspace with Bun, TypeScript, Tailwind, and Biome.
         </p>
-      </section>
+        <ModelTester />
+      </div>
     </main>
   );
 }

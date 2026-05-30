@@ -13,6 +13,10 @@ A public Next.js workspace for SDK operations, built with Bun, TypeScript, Tailw
 bun install
 ```
 
+## Environment
+
+Create `.env.local` and set `AI_PROVIDER_API_KEY`; optionally set `AI_PROVIDER_BASE_URL` and `AI_PROVIDER_MODEL` to target a compatible provider or model.
+
 ## Run
 
 ```bash
