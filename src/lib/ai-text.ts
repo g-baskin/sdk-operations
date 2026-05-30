@@ -1,6 +1,11 @@
-import type { ResponseInputItem } from "openai/resources/responses/responses";
-import { shouldFallbackAIRequest, toAIRequestError } from "./ai-errors";
+import type {
+  ResponseFunctionToolCall,
+  ResponseInputItem,
+} from "openai/resources/responses/responses";
+import { shouldFallbackAIRequest } from "./ai-errors";
 import { withAIRetry } from "./ai-retry";
+import { buildAISystemPrompt } from "./ai-system-prompt";
+import { aiTools, buildToolResultInput, type ToolCallResult } from "./ai-tools";
 import {
   type AIModelTier,
   type AIProviderTarget,
@@ -9,12 +14,35 @@ import {
   hasBackupAIProvider,
 } from "./openai-client";
 
-type TextRequest = {
-  imageUrl?: string | undefined;
-  input: string;
-  modelTier?: AIModelTier;
+export type ConversationTurn = {
+  content: string;
+  role: "assistant" | "user";
 };
 
+export type MemoryFact = {
+  content: string;
+};
+
+type TextRequest = {
+  conversationHistory?: readonly ConversationTurn[] | undefined;
+  conversationSummary?: string | undefined;
+  imageUrl?: string | undefined;
+  input: string;
+  memories?: readonly MemoryFact[] | undefined;
+  modelTier?: AIModelTier;
+  userContext?: string | undefined;
+  userName?: string | undefined;
+};
+
+export type TextResponse = {
+  output: string;
+  toolResults: ToolCallResult[];
+};
+
+const maxMemoryContextChars = 2500;
+const maxMemoryContextCount = 8;
+export const maxToolCallIterations = 4;
+const recentHistoryLimit = 8;
 const complexRequestPattern =
   /\b(analy[sz]e|architecture|compare|complex|debug|design|diagnose|explain|image|plan|reason|refactor|review|strategy|vision)\b/i;
 
@@ -34,20 +62,83 @@ function resolveModelTier({
   return "fast";
 }
 
-function buildModelInput({
-  imageUrl,
+function buildConversationText({
+  conversationHistory,
+  conversationSummary,
   input,
-}: TextRequest): string | ResponseInputItem[] {
-  if (!imageUrl) {
+  memories,
+}: TextRequest): string {
+  const recentTurns = (conversationHistory ?? [])
+    .filter((turn) => turn.content.trim().length > 0)
+    .slice(-recentHistoryLimit);
+  const contextSections: string[] = [];
+
+  let usedMemoryChars = 0;
+  const relevantMemories = (memories ?? [])
+    .flatMap((memory): MemoryFact[] => {
+      if (usedMemoryChars >= maxMemoryContextChars) {
+        return [];
+      }
+
+      const remainingChars = maxMemoryContextChars - usedMemoryChars;
+      const content = memory.content.trim().slice(0, remainingChars).trim();
+
+      if (!content) {
+        return [];
+      }
+
+      usedMemoryChars += content.length;
+      return [{ content }];
+    })
+    .slice(0, maxMemoryContextCount);
+
+  if (relevantMemories.length > 0) {
+    contextSections.push(
+      `Long-term memory for this student/project:\n${relevantMemories
+        .map((memory) => `- ${memory.content.trim()}`)
+        .join("\n")}`,
+    );
+  }
+
+  if (conversationSummary?.trim()) {
+    contextSections.push(
+      `Older conversation summary:\n${conversationSummary.trim()}`,
+    );
+  }
+
+  if (recentTurns.length > 0) {
+    const historyText = recentTurns
+      .map(
+        (turn) =>
+          `${turn.role === "user" ? "Student" : "Assistant"}: ${turn.content}`,
+      )
+      .join("\n");
+
+    contextSections.push(
+      `Recent conversation in this session:\n${historyText}`,
+    );
+  }
+
+  if (contextSections.length === 0) {
     return input;
+  }
+
+  return `${contextSections.join("\n\n")}\n\nCurrent student message:\n${input}`;
+}
+
+function buildModelInput(request: TextRequest): string | ResponseInputItem[] {
+  const textInput = buildConversationText(request);
+
+  if (!request.imageUrl) {
+    return textInput;
   }
 
   return [
     {
       role: "user",
       content: [
-        { type: "input_text", text: input },
-        { type: "input_image", image_url: imageUrl, detail: "auto" },
+        { type: "input_text", text: textInput },
+        { type: "input_image", image_url: request.imageUrl, detail: "auto" },
       ],
     },
   ];
@@ -67,57 +158,94 @@ async function withAIProviderFallback<T>(
   }
 }
 
-export async function generateText(request: TextRequest): Promise<string> {
+function getFunctionToolCalls(
+  responseOutput: readonly unknown[],
+): ResponseFunctionToolCall[] {
+  return responseOutput.filter((item): item is ResponseFunctionToolCall => {
+    if (!item || typeof item !== "object") {
+      return false;
+    }
+
+    return (
+      "type" in item &&
+      item.type === "function_call" &&
+      "call_id" in item &&
+      typeof item.call_id === "string" &&
+      "name" in item &&
+      typeof item.name === "string" &&
+      "arguments" in item &&
+      typeof item.arguments === "string"
+    );
+  });
+}
+
+function toResponseInputItems(
+  modelInput: string | ResponseInputItem[],
+): ResponseInputItem[] {
+  if (Array.isArray(modelInput)) {
+    return modelInput;
+  }
+
+  return [{ role: "user", content: modelInput } satisfies ResponseInputItem];
+}
+
+export async function generateText(
+  request: TextRequest,
+): Promise<TextResponse> {
   const modelTier = resolveModelTier(request);
   const modelInput = buildModelInput(request);
-  const response = await withAIProviderFallback((target) =>
+  const systemPrompt = buildAISystemPrompt({
+    currentDate: new Date().toISOString().slice(0, 10),
+    userContext: request.userContext,
+    userName: request.userName,
+  });
+  const toolResults: ToolCallResult[] = [];
+  let currentInput = toResponseInputItems(modelInput);
+
+  for (let iteration = 0; iteration < maxToolCallIterations; iteration += 1) {
+    const response = await withAIProviderFallback((target) =>
+      getAIClient(target).responses.create({
+        model: getAIModel(modelTier, target),
+        instructions: systemPrompt,
+        input: currentInput,
+        tools: aiTools,
+        stream: false,
+      }),
+    );
+    const toolCalls = getFunctionToolCalls(response.output);
+
+    if (toolCalls.length === 0) {
+      return { output: response.output_text, toolResults };
+    }
+
+    const toolResultInput = buildToolResultInput(toolCalls);
+    toolResults.push(...toolResultInput.results);
+    currentInput = [...currentInput, ...toolCalls, ...toolResultInput.input];
+  }
+
+  const finalResponse = await withAIProviderFallback((target) =>
     getAIClient(target).responses.create({
       model: getAIModel(modelTier, target),
-      input: modelInput,
+      instructions: systemPrompt,
+      input: currentInput,
+      tool_choice: "none",
+      tools: aiTools,
+      stream: false,
     }),
   );
 
-  return response.output_text;
+  return { output: finalResponse.output_text, toolResults };
 }
 
 export async function streamText(
   request: TextRequest,
 ): Promise<ReadableStream<Uint8Array>> {
   const encoder = new TextEncoder();
-  const modelTier = resolveModelTier(request);
-  const modelInput = buildModelInput(request);
-  const stream = await withAIProviderFallback((target) =>
-    getAIClient(target).responses.create({
-      model: getAIModel(modelTier, target),
-      input: modelInput,
-      stream: true,
-    }),
-  );
 
   return new ReadableStream({
     async start(controller) {
-      try {
-        for await (const event of stream) {
-          if (event.type === "response.output_text.delta") {
-            controller.enqueue(encoder.encode(event.delta));
-          }
-
-          if (event.type === "error") {
-            throw new Error(event.message);
-          }
-
-          if (event.type === "response.failed") {
-            throw new Error("AI provider response failed while streaming.");
-          }
-        }
-      } catch (error) {
-        controller.enqueue(
-          encoder.encode(`\n\nError: ${toAIRequestError(error).message}`),
-        );
-        controller.close();
-        return;
-      }
-
+      const response = await generateText(request);
+      controller.enqueue(encoder.encode(response.output));
       controller.close();
     },
   });
