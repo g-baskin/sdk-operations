@@ -31,8 +31,6 @@ type SavedConversation = {
   updatedAt: string;
 };
 
-const savedConversationStoragePrefix = "sdk-operations:conversations";
-const savedMemoryStoragePrefix = "sdk-operations:memories";
 const defaultConversationHistoryCharLimit = 12000;
 const maxRelevantMemoryChars = 2500;
 const maxRelevantMemoryCount = 8;
@@ -59,18 +57,6 @@ function getConversationUserKey(userName: string): string | undefined {
   }
 
   return normalizedName.replace(/[^a-z0-9_-]+/g, "-");
-}
-
-function getConversationStorageKey(userName: string): string | undefined {
-  const userKey = getConversationUserKey(userName);
-
-  return userKey ? `${savedConversationStoragePrefix}:${userKey}` : undefined;
-}
-
-function getMemoryStorageKey(userName: string): string | undefined {
-  const userKey = getConversationUserKey(userName);
-
-  return userKey ? `${savedMemoryStoragePrefix}:${userKey}` : undefined;
 }
 
 function getConversationSize(
@@ -192,92 +178,6 @@ function isSavedConversation(value: unknown): value is SavedConversation {
   );
 }
 
-function readSavedConversations(userName: string): SavedConversation[] {
-  const storageKey = getConversationStorageKey(userName);
-
-  if (!storageKey) {
-    return [];
-  }
-
-  try {
-    const storedValue = window.localStorage.getItem(storageKey);
-
-    if (!storedValue) {
-      return [];
-    }
-
-    const parsedValue = JSON.parse(storedValue) as unknown;
-
-    if (!Array.isArray(parsedValue)) {
-      return [];
-    }
-
-    return parsedValue
-      .filter(isSavedConversation)
-      .map((conversation) => ({
-        ...conversation,
-        summary: conversation.summary ?? "",
-      }))
-      .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
-  } catch {
-    return [];
-  }
-}
-
-function writeSavedConversations(
-  userName: string,
-  conversations: readonly SavedConversation[],
-): void {
-  const storageKey = getConversationStorageKey(userName);
-
-  if (!storageKey) {
-    return;
-  }
-
-  window.localStorage.setItem(storageKey, JSON.stringify(conversations));
-}
-
-function readSavedMemories(userName: string): MemoryFact[] {
-  const storageKey = getMemoryStorageKey(userName);
-
-  if (!storageKey) {
-    return [];
-  }
-
-  try {
-    const storedValue = window.localStorage.getItem(storageKey);
-
-    if (!storedValue) {
-      return [];
-    }
-
-    const parsedValue = JSON.parse(storedValue) as unknown;
-
-    if (!Array.isArray(parsedValue)) {
-      return [];
-    }
-
-    return parsedValue
-      .filter(isMemoryFact)
-      .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
-  } catch {
-    return [];
-  }
-}
-
-function writeSavedMemories(
-  userName: string,
-  memories: readonly MemoryFact[],
-): void {
-  const storageKey = getMemoryStorageKey(userName);
-
-  if (!storageKey) {
-    return;
-  }
-
-  window.localStorage.setItem(storageKey, JSON.stringify(memories));
-}
-
 function getMemoryContentFromInput(input: string): string | undefined {
   const normalizedInput = input.toLowerCase();
   const trigger = [
@@ -378,6 +278,28 @@ function getRelevantMemories({
     .slice(0, maxRelevantMemoryCount);
 }
 
+async function readJsonResponse(response: Response): Promise<unknown> {
+  const responseText = await response.text();
+
+  if (!responseText.trim()) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(responseText) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function getResponseError(data: unknown): string | undefined {
+  if (!data || typeof data !== "object" || !("error" in data)) {
+    return undefined;
+  }
+
+  return typeof data.error === "string" ? data.error : undefined;
+}
+
 function readImageAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -446,11 +368,58 @@ export function ModelTester() {
       return;
     }
 
-    setSavedConversations(readSavedConversations(userName));
-    setMemories(readSavedMemories(userName));
+    if (!conversationUserKey) {
+      setSavedConversations([]);
+      setMemories([]);
+      setMemoryInput("");
+      setSavedConversationId("");
+      return;
+    }
+
+    const abortController = new AbortController();
+
+    async function loadStoredData(): Promise<void> {
+      try {
+        const query = new URLSearchParams({ userName }).toString();
+        const [conversationResponse, memoryResponse] = await Promise.all([
+          fetch(`/api/conversations?${query}`, {
+            signal: abortController.signal,
+          }),
+          fetch(`/api/memories?${query}`, { signal: abortController.signal }),
+        ]);
+        const conversationData = await readJsonResponse(conversationResponse);
+        const memoryData = await readJsonResponse(memoryResponse);
+        const conversations =
+          conversationData &&
+          typeof conversationData === "object" &&
+          "conversations" in conversationData &&
+          Array.isArray(conversationData.conversations)
+            ? conversationData.conversations.filter(isSavedConversation)
+            : [];
+        const storedMemories =
+          memoryData &&
+          typeof memoryData === "object" &&
+          "memories" in memoryData &&
+          Array.isArray(memoryData.memories)
+            ? memoryData.memories.filter(isMemoryFact)
+            : [];
+
+        setSavedConversations(conversations);
+        setMemories(storedMemories);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          setSavedConversations([]);
+          setMemories([]);
+        }
+      }
+    }
+
     setMemoryInput("");
     setSavedConversationId("");
-  }, [hasHydrated, userName]);
+    void loadStoredData();
+
+    return () => abortController.abort();
+  }, [conversationUserKey, hasHydrated, userName]);
 
   function applyCompactedConversation(
     nextHistory: readonly ConversationTurn[],
@@ -465,7 +434,7 @@ export function ModelTester() {
     setConversationSummary(compactedConversation.summary);
   }
 
-  function saveCurrentConversation(): void {
+  async function saveCurrentConversation(): Promise<void> {
     if (!canSaveConversation) {
       return;
     }
@@ -480,9 +449,30 @@ export function ModelTester() {
         .find((turn) => turn.role === "user")
         ?.content.slice(0, 48) || "SDK conversation";
     const title = conversationTitle.trim() || fallbackTitle;
+    const fallbackId = savedConversationId || crypto.randomUUID();
+    const response = await fetch("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        conversationId: savedConversationId || undefined,
+        history: compactedConversation.history,
+        summary: compactedConversation.summary,
+        title,
+        userName,
+      }),
+    });
+    const data = await readJsonResponse(response);
+    const persistedId =
+      response.ok &&
+      data &&
+      typeof data === "object" &&
+      "id" in data &&
+      typeof data.id === "string"
+        ? data.id
+        : fallbackId;
     const savedConversation: SavedConversation = {
       history: compactedConversation.history,
-      id: savedConversationId || crypto.randomUUID(),
+      id: persistedId,
       summary: compactedConversation.summary,
       title,
       updatedAt: now,
@@ -494,7 +484,6 @@ export function ModelTester() {
       ),
     ];
 
-    writeSavedConversations(userName, nextConversations);
     setConversationHistory(compactedConversation.history);
     setConversationSummary(compactedConversation.summary);
     setConversationTitle(title);
@@ -502,7 +491,7 @@ export function ModelTester() {
     setSavedConversations(nextConversations);
   }
 
-  function loadConversation(conversationId: string): void {
+  async function loadConversation(conversationId: string): Promise<void> {
     const savedConversation = savedConversations.find(
       (conversation) => conversation.id === conversationId,
     );
@@ -527,7 +516,7 @@ export function ModelTester() {
     setSavedConversationId("");
   }
 
-  function clearSelectedConversationHistory(): void {
+  async function clearSelectedConversationHistory(): Promise<void> {
     if (!savedConversationId) {
       startNewConversation();
       return;
@@ -554,14 +543,18 @@ export function ModelTester() {
         : conversation,
     );
 
-    writeSavedConversations(userName, nextConversations);
+    await fetch("/api/conversations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: savedConversationId, userName }),
+    });
     setConversationHistory([]);
     setConversationSummary("");
     setOutput("");
     setSavedConversations(nextConversations);
   }
 
-  function deleteSelectedConversation(): void {
+  async function deleteSelectedConversation(): Promise<void> {
     if (!savedConversationId) {
       return;
     }
@@ -570,47 +563,73 @@ export function ModelTester() {
       (conversation) => conversation.id !== savedConversationId,
     );
 
-    writeSavedConversations(userName, nextConversations);
+    await fetch(
+      `/api/conversations?${new URLSearchParams({ conversationId: savedConversationId, userName }).toString()}`,
+      { method: "DELETE" },
+    );
     startNewConversation();
     setSavedConversations(nextConversations);
   }
 
-  function saveMemoryContent(content: string): void {
+  async function saveMemoryContent(content: string): Promise<void> {
     if (!content || !conversationUserKey) {
       return;
     }
 
+    const response = await fetch("/api/memories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, userName }),
+    });
+    const data = await readJsonResponse(response);
+    const memoryId =
+      response.ok &&
+      data &&
+      typeof data === "object" &&
+      "id" in data &&
+      typeof data.id === "string"
+        ? data.id
+        : crypto.randomUUID();
     const nextMemories = [
-      { id: crypto.randomUUID(), content, updatedAt: new Date().toISOString() },
+      { id: memoryId, content, updatedAt: new Date().toISOString() },
       ...memories.filter((memory) => memory.content !== content),
     ];
 
-    writeSavedMemories(userName, nextMemories);
     setMemories(nextMemories);
   }
 
-  function saveMemory(): void {
+  async function saveMemory(): Promise<void> {
     const content = memoryInput.trim();
 
-    saveMemoryContent(content);
+    await saveMemoryContent(content);
     setMemoryInput("");
   }
 
-  function updateMemory(memoryId: string, content: string): void {
+  async function updateMemory(
+    memoryId: string,
+    content: string,
+  ): Promise<void> {
     const nextMemories = memories.map((memory) =>
       memory.id === memoryId
         ? { ...memory, content, updatedAt: new Date().toISOString() }
         : memory,
     );
 
-    writeSavedMemories(userName, nextMemories);
+    await fetch("/api/memories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, memoryId, userName }),
+    });
     setMemories(nextMemories);
   }
 
-  function deleteMemory(memoryId: string): void {
+  async function deleteMemory(memoryId: string): Promise<void> {
     const nextMemories = memories.filter((memory) => memory.id !== memoryId);
 
-    writeSavedMemories(userName, nextMemories);
+    await fetch(
+      `/api/memories?${new URLSearchParams({ memoryId, userName }).toString()}`,
+      { method: "DELETE" },
+    );
     setMemories(nextMemories);
   }
 
@@ -629,12 +648,10 @@ export function ModelTester() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...requestBody, stream: false }),
       });
-      const data = (await response.json()) as ModelResponse;
+      const data = (await readJsonResponse(response)) as ModelResponse;
 
       if (!response.ok) {
-        setOutput(
-          typeof data.error === "string" ? data.error : "Request failed.",
-        );
+        setOutput(getResponseError(data) ?? "Request failed.");
         return;
       }
 
@@ -679,7 +696,7 @@ export function ModelTester() {
 
       const memoryContent = getMemoryContentFromInput(userMessage);
       if (memoryContent) {
-        saveMemoryContent(memoryContent);
+        void saveMemoryContent(memoryContent);
       }
 
       setInput("");
@@ -708,10 +725,8 @@ export function ModelTester() {
       });
 
       if (!response.ok) {
-        const data = (await response.json()) as ModelResponse;
-        setOutput(
-          typeof data.error === "string" ? data.error : "Request failed.",
-        );
+        const data = (await readJsonResponse(response)) as ModelResponse;
+        setOutput(getResponseError(data) ?? "Request failed.");
         return;
       }
 
@@ -811,15 +826,17 @@ export function ModelTester() {
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <button
             type="button"
-            onClick={saveMemory}
+            onClick={() => {
+              void saveMemory();
+            }}
             disabled={!conversationUserKey || memoryInput.trim().length === 0}
             className="rounded-full border border-zinc-300 px-5 py-2.5 text-sm font-medium text-zinc-600 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300"
           >
             Save memory
           </button>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Memories are stored in this browser, separated by student name, and
-            reused in new conversations.
+            Memories are stored in the local app database, separated by student
+            name, and reused in new conversations.
           </p>
         </div>
         {memories.length > 0 ? (
@@ -834,9 +851,19 @@ export function ModelTester() {
               >
                 <textarea
                   value={memory.content}
-                  onChange={(event) =>
-                    updateMemory(memory.id, event.target.value)
-                  }
+                  onBlur={(event) => {
+                    void updateMemory(memory.id, event.target.value);
+                  }}
+                  onChange={(event) => {
+                    const content = event.target.value;
+                    setMemories((currentMemories) =>
+                      currentMemories.map((currentMemory) =>
+                        currentMemory.id === memory.id
+                          ? { ...currentMemory, content }
+                          : currentMemory,
+                      ),
+                    );
+                  }}
                   className="min-h-16 w-full rounded-lg border border-zinc-300 bg-white p-2 text-zinc-950 outline-none focus:border-zinc-950 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-50 dark:focus:border-zinc-50"
                   aria-label="Edit saved memory"
                 />
@@ -846,7 +873,9 @@ export function ModelTester() {
                   </span>
                   <button
                     type="button"
-                    onClick={() => deleteMemory(memory.id)}
+                    onClick={() => {
+                      void deleteMemory(memory.id);
+                    }}
                     className="shrink-0 text-xs font-medium text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
                   >
                     Delete memory
@@ -913,7 +942,9 @@ export function ModelTester() {
             Load saved conversation
             <select
               value={savedConversationId}
-              onChange={(event) => loadConversation(event.target.value)}
+              onChange={(event) => {
+                void loadConversation(event.target.value);
+              }}
               disabled={!conversationUserKey || savedConversations.length === 0}
               className="mt-2 w-full rounded-xl border border-zinc-300 bg-transparent p-3 text-zinc-950 outline-none focus:border-zinc-950 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-50 dark:focus:border-zinc-50"
             >
@@ -933,7 +964,9 @@ export function ModelTester() {
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <button
             type="button"
-            onClick={clearSelectedConversationHistory}
+            onClick={() => {
+              void clearSelectedConversationHistory();
+            }}
             disabled={
               isLoading ||
               (!savedConversationId &&
@@ -946,7 +979,9 @@ export function ModelTester() {
           </button>
           <button
             type="button"
-            onClick={deleteSelectedConversation}
+            onClick={() => {
+              void deleteSelectedConversation();
+            }}
             disabled={isLoading || !savedConversationId}
             className="rounded-full border border-zinc-300 px-4 py-2 text-xs font-medium text-zinc-600 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300"
           >
@@ -954,9 +989,9 @@ export function ModelTester() {
           </button>
         </div>
         <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-          Saved in this browser and separated by student name. History compacts
-          at {historyLimit.toLocaleString()} characters; current size is about{" "}
-          {historySize.toLocaleString()} characters.
+          Saved in the local app database and separated by student name. History
+          compacts at {historyLimit.toLocaleString()} characters; current size
+          is about {historySize.toLocaleString()} characters.
         </p>
       </div>
       <div className="mt-4 flex flex-wrap gap-3">
@@ -978,7 +1013,9 @@ export function ModelTester() {
         </button>
         <button
           type="button"
-          onClick={saveCurrentConversation}
+          onClick={() => {
+            void saveCurrentConversation();
+          }}
           disabled={isLoading || !canSaveConversation}
           className="rounded-full border border-zinc-300 px-5 py-2.5 text-sm font-medium text-zinc-600 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300"
         >

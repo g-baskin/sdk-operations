@@ -3,6 +3,7 @@ import type {
   ResponseFunctionToolCall,
   ResponseInputItem,
 } from "openai/resources/responses/responses";
+import { logToolCallToDatabase } from "./database";
 
 export type ToolCallResult = {
   name: string;
@@ -70,17 +71,38 @@ function logToolCall({
   outcome: "blocked" | "executed" | "unknown" | "validation_error";
   policy?: ToolPolicy | undefined;
 }): void {
-  console.info(
-    JSON.stringify({
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    callId,
+    detail,
+    name,
+    outcome,
+    policy,
+    timestamp,
+    type: "ai_tool_call",
+  };
+
+  console.info(JSON.stringify(logEntry));
+
+  try {
+    logToolCallToDatabase({
       callId,
       detail,
       name,
       outcome,
-      policy,
-      timestamp: new Date().toISOString(),
-      type: "ai_tool_call",
-    }),
-  );
+      policyJson: JSON.stringify(policy ?? null),
+      timestamp,
+    });
+  } catch (error) {
+    console.warn(
+      JSON.stringify({
+        detail:
+          error instanceof Error ? error.message : "Unknown logging error.",
+        timestamp: new Date().toISOString(),
+        type: "ai_tool_call_log_error",
+      }),
+    );
+  }
 }
 
 function parseToolArguments(rawArguments: string): unknown {
