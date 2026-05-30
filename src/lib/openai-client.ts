@@ -1,15 +1,23 @@
 import OpenAI from "openai";
 
-const defaultAIModel = "gpt-4.1-mini";
+const defaultAIFastModel = "openai/gpt-4o-mini";
+const defaultAIFlagshipModel = "openai/gpt-4o";
+
+export type AIModelTier = "auto" | "fast" | "flagship";
+
+export type AIProviderTarget = "backup" | "primary";
 
 type AIProviderConfig = {
   apiKey: string;
   baseURL?: string;
-  model: string;
+  fastModel: string;
+  flagshipModel: string;
 };
 
-let openAIClient: OpenAI | undefined;
-let aiProviderConfig: AIProviderConfig | undefined;
+let primaryAIClient: OpenAI | undefined;
+let backupAIClient: OpenAI | undefined;
+let primaryAIProviderConfig: AIProviderConfig | undefined;
+let backupAIProviderConfig: AIProviderConfig | undefined | null;
 
 function readRequiredEnv(name: string): string {
   const value = process.env[name];
@@ -26,32 +34,107 @@ function readOptionalEnv(name: string): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
-export function getAIProviderConfig(): AIProviderConfig {
-  if (aiProviderConfig) {
-    return aiProviderConfig;
+function applyOptionalBaseURL(
+  config: AIProviderConfig,
+  baseURL: string | undefined,
+): AIProviderConfig {
+  if (!baseURL) {
+    return config;
   }
 
-  const baseURL = readOptionalEnv("AI_PROVIDER_BASE_URL");
-  const config: AIProviderConfig = {
-    apiKey: readRequiredEnv("AI_PROVIDER_API_KEY"),
-    model: readOptionalEnv("AI_PROVIDER_MODEL") ?? defaultAIModel,
-  };
-
-  if (baseURL) {
-    config.baseURL = baseURL;
-  }
-
-  aiProviderConfig = config;
-  return config;
+  return { ...config, baseURL };
 }
 
-export function getAIClient(): OpenAI {
-  const config = getAIProviderConfig();
+function getBackupAIProviderConfig(): AIProviderConfig | null {
+  if (backupAIProviderConfig !== undefined) {
+    return backupAIProviderConfig;
+  }
 
-  openAIClient ??= new OpenAI({
+  const apiKey = readOptionalEnv("AI_BACKUP_PROVIDER_API_KEY");
+
+  if (!apiKey) {
+    backupAIProviderConfig = null;
+    return backupAIProviderConfig;
+  }
+
+  backupAIProviderConfig = applyOptionalBaseURL(
+    {
+      apiKey,
+      fastModel:
+        readOptionalEnv("AI_BACKUP_PROVIDER_FAST_MODEL") ?? defaultAIFastModel,
+      flagshipModel:
+        readOptionalEnv("AI_BACKUP_PROVIDER_FLAGSHIP_MODEL") ??
+        defaultAIFlagshipModel,
+    },
+    readOptionalEnv("AI_BACKUP_PROVIDER_BASE_URL"),
+  );
+
+  return backupAIProviderConfig;
+}
+
+export function getAIProviderConfig(
+  target: AIProviderTarget = "primary",
+): AIProviderConfig {
+  if (target === "backup") {
+    const backupConfig = getBackupAIProviderConfig();
+
+    if (!backupConfig) {
+      throw new Error(
+        "AI_BACKUP_PROVIDER_API_KEY is required to use the backup AI provider.",
+      );
+    }
+
+    return backupConfig;
+  }
+
+  if (primaryAIProviderConfig) {
+    return primaryAIProviderConfig;
+  }
+
+  primaryAIProviderConfig = applyOptionalBaseURL(
+    {
+      apiKey: readRequiredEnv("AI_PROVIDER_API_KEY"),
+      fastModel:
+        readOptionalEnv("AI_PROVIDER_FAST_MODEL") ??
+        readOptionalEnv("AI_PROVIDER_MODEL") ??
+        defaultAIFastModel,
+      flagshipModel:
+        readOptionalEnv("AI_PROVIDER_FLAGSHIP_MODEL") ?? defaultAIFlagshipModel,
+    },
+    readOptionalEnv("AI_PROVIDER_BASE_URL"),
+  );
+
+  return primaryAIProviderConfig;
+}
+
+export function hasBackupAIProvider(): boolean {
+  return getBackupAIProviderConfig() !== null;
+}
+
+export function getAIModel(
+  modelTier: Exclude<AIModelTier, "auto">,
+  target: AIProviderTarget = "primary",
+): string {
+  const config = getAIProviderConfig(target);
+  return modelTier === "flagship" ? config.flagshipModel : config.fastModel;
+}
+
+export function getAIClient(target: AIProviderTarget = "primary"): OpenAI {
+  const config = getAIProviderConfig(target);
+
+  if (target === "backup") {
+    backupAIClient ??= new OpenAI({
+      apiKey: config.apiKey,
+      baseURL: config.baseURL,
+    });
+
+    return backupAIClient;
+  }
+
+  primaryAIClient ??= new OpenAI({
     apiKey: config.apiKey,
     baseURL: config.baseURL,
   });
 
-  return openAIClient;
+  return primaryAIClient;
 }

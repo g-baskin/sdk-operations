@@ -1,30 +1,95 @@
-import { toAIRequestError } from "./ai-errors";
+import type { ResponseInputItem } from "openai/resources/responses/responses";
+import { shouldFallbackAIRequest, toAIRequestError } from "./ai-errors";
 import { withAIRetry } from "./ai-retry";
-import { getAIClient, getAIProviderConfig } from "./openai-client";
+import {
+  type AIModelTier,
+  type AIProviderTarget,
+  getAIClient,
+  getAIModel,
+  hasBackupAIProvider,
+} from "./openai-client";
 
 type TextRequest = {
+  imageUrl?: string | undefined;
   input: string;
+  modelTier?: AIModelTier;
 };
 
-export async function generateText({ input }: TextRequest): Promise<string> {
-  const response = await withAIRetry(() =>
-    getAIClient().responses.create({
-      model: getAIProviderConfig().model,
-      input,
+const complexRequestPattern =
+  /\b(analy[sz]e|architecture|compare|complex|debug|design|diagnose|explain|image|plan|reason|refactor|review|strategy|vision)\b/i;
+
+function resolveModelTier({
+  imageUrl,
+  input,
+  modelTier,
+}: TextRequest): Exclude<AIModelTier, "auto"> {
+  if (modelTier === "fast" || modelTier === "flagship") {
+    return modelTier;
+  }
+
+  if (imageUrl || input.length > 1000 || complexRequestPattern.test(input)) {
+    return "flagship";
+  }
+
+  return "fast";
+}
+
+function buildModelInput({
+  imageUrl,
+  input,
+}: TextRequest): string | ResponseInputItem[] {
+  if (!imageUrl) {
+    return input;
+  }
+
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: input },
+        { type: "input_image", image_url: imageUrl, detail: "auto" },
+      ],
+    },
+  ];
+}
+
+async function withAIProviderFallback<T>(
+  operation: (target: AIProviderTarget) => Promise<T>,
+): Promise<T> {
+  try {
+    return await withAIRetry(() => operation("primary"));
+  } catch (error) {
+    if (!hasBackupAIProvider() || !shouldFallbackAIRequest(error)) {
+      throw error;
+    }
+
+    return await withAIRetry(() => operation("backup"));
+  }
+}
+
+export async function generateText(request: TextRequest): Promise<string> {
+  const modelTier = resolveModelTier(request);
+  const modelInput = buildModelInput(request);
+  const response = await withAIProviderFallback((target) =>
+    getAIClient(target).responses.create({
+      model: getAIModel(modelTier, target),
+      input: modelInput,
     }),
   );
 
   return response.output_text;
 }
 
-export async function streamText({
-  input,
-}: TextRequest): Promise<ReadableStream<Uint8Array>> {
+export async function streamText(
+  request: TextRequest,
+): Promise<ReadableStream<Uint8Array>> {
   const encoder = new TextEncoder();
-  const stream = await withAIRetry(() =>
-    getAIClient().responses.create({
-      model: getAIProviderConfig().model,
-      input,
+  const modelTier = resolveModelTier(request);
+  const modelInput = buildModelInput(request);
+  const stream = await withAIProviderFallback((target) =>
+    getAIClient(target).responses.create({
+      model: getAIModel(modelTier, target),
+      input: modelInput,
       stream: true,
     }),
   );

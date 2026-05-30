@@ -15,7 +15,7 @@ bun install
 
 ## Environment
 
-Create `.env.local` and set `AI_PROVIDER_API_KEY`; optionally set `AI_PROVIDER_BASE_URL` and `AI_PROVIDER_MODEL` to target a compatible provider or model.
+Create `.env.local` and set `AI_PROVIDER_API_KEY`; optionally set `AI_PROVIDER_BASE_URL`, `AI_PROVIDER_FAST_MODEL`, `AI_PROVIDER_FLAGSHIP_MODEL`, and backup provider variables to route simple vs complex requests and fail over when the primary provider is unavailable.
 
 ## Run
 

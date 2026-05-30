@@ -17,7 +17,8 @@ A Bun-managed Next.js app for testing OpenAI-compatible AI providers through a s
 - Runtime provider settings come from environment variables, not code changes.
 - Required: `AI_PROVIDER_API_KEY`.
 - Optional: `AI_PROVIDER_BASE_URL` for OpenAI-compatible providers such as OpenRouter.
-- Optional: `AI_PROVIDER_MODEL`; defaults to `gpt-4.1-mini` in `src/lib/openai-client.ts`.
+- Optional: `AI_PROVIDER_FAST_MODEL` for straightforward requests and `AI_PROVIDER_FLAGSHIP_MODEL` for complex or explicitly flagship requests.
+- Optional backup provider variables use the `AI_BACKUP_PROVIDER_*` prefix and are tried when primary provider calls fail or rate-limit.
 - Real secrets belong in `.env.local`, which is ignored by Git.
 - Streaming responses are plain `text/plain` chunks, not SSE.
 

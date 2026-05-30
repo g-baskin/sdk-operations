@@ -32,6 +32,11 @@ export function shouldRetryAIRequest(error: unknown): boolean {
   return getAIErrorDetails(error).retryable;
 }
 
+export function shouldFallbackAIRequest(error: unknown): boolean {
+  const details = getAIErrorDetails(error);
+  return details.retryable || details.statusCode === 429;
+}
+
 function getAIErrorDetails(error: unknown): AIErrorDetails {
   if (error instanceof AuthenticationError) {
     return {
